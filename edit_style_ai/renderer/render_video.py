@@ -1,68 +1,137 @@
-from moviepy.editor import ImageClip, VideoFileClip, concatenate_videoclips, vfx
+import os
+import shutil
+import subprocess
+import tempfile
+from shutil import which
+
+try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None
 
 
-def _fit_to_portrait(clip, target_w=1080, target_h=1920):
-    """Resize and center-crop to 1080x1920 while preserving aspect ratio."""
-    aspect = clip.w / clip.h
-    target_aspect = target_w / target_h
-
-    if aspect >= target_aspect:
-        # Wider than target: fit height, crop width
-        clip = clip.resize(height=target_h)
-    else:
-        # Taller than target: fit width, crop height
-        clip = clip.resize(width=target_w)
-
-    return clip.crop(
-        width=target_w,
-        height=target_h,
-        x_center=clip.w / 2,
-        y_center=clip.h / 2,
-    )
+def _scale_filter():
+    # Fit to cover 1080x1920: scale up preserving AR, then center-crop.
+    return "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 
 
-def render(timeline, output="output/final.mp4"):
-    """
-    Render timeline of video and image clips into a final 1080x1920 video.
+def _run(cmd):
+    ffmpeg_bin = None
 
-    - Images: duration set to shot length + gentle Ken Burns (zoom-in).
-    - Videos: trimmed to shot length, resized/cropped to portrait.
-    - Concatenates all clips; requires ffmpeg available for moviepy.
-    """
-
-    clips = []
-
-    for i, shot in enumerate(timeline):
+    # Prefer bundled ffmpeg from imageio-ffmpeg if available
+    if imageio_ffmpeg is not None:
         try:
+            ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_bin = None
+
+    # Fallback to PATH
+    if ffmpeg_bin is None:
+        ffmpeg_bin = which("ffmpeg")
+
+    if cmd and cmd[0] == "ffmpeg":
+        if ffmpeg_bin:
+            cmd = [ffmpeg_bin] + cmd[1:]
+        else:
+            raise FileNotFoundError(
+                "ffmpeg not found. Install it, add to PATH, or install imageio-ffmpeg."
+            )
+
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        print("\nFFmpeg stderr:\n", res.stderr)
+        raise subprocess.CalledProcessError(res.returncode, cmd, output=res.stdout, stderr=res.stderr)
+
+
+def render(timeline, output="output/final.mp4", audio_path=None):
+    """
+    FFmpeg-based render: per-shot transcode to 1080x1920 MP4, then concat, then mux audio if provided.
+    MoviePy is avoided for rendering to prevent Windows handle issues.
+    """
+
+    os.makedirs(os.path.dirname(output) or "./", exist_ok=True)
+    tmpdir = tempfile.mkdtemp(prefix="render_ffmpeg_")
+    shot_files = []
+
+    try:
+        # Per-shot render
+        for idx, shot in enumerate(timeline):
+            asset = shot["asset"]
+            if not os.path.exists(asset):
+                raise FileNotFoundError(f"Asset not found: {asset}")
+
             duration = max(float(shot.get("duration", 0)), 0.01)
+            out_path = os.path.join(tmpdir, f"shot_{idx}.mp4")
 
             if shot["type"] == "image":
-                clip = ImageClip(shot["asset"]).set_duration(duration)
-                # Gentle zoom-in over the clip duration
-                zoom_amount = 0.05
-                clip = clip.fx(vfx.resize, lambda t: 1 + zoom_amount * (t / duration))
-                clip = _fit_to_portrait(clip)
-                clips.append(clip)
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-loop", "1",
+                    "-i", asset,
+                    "-t", str(duration),
+                    "-vf", _scale_filter(),
+                    "-r", "30",
+                    "-pix_fmt", "yuv420p",
+                    "-an",
+                    out_path,
+                ]
             else:
-                clip = VideoFileClip(shot["asset"])
-                clip = clip.subclip(0, min(duration, clip.duration))
-                clip = _fit_to_portrait(clip)
-                clips.append(clip)
-        except Exception as e:
-            print(f"Error processing shot {i} ({shot['asset']}): {e}")
-            continue
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", asset,
+                    "-t", str(duration),
+                    "-vf", _scale_filter(),
+                    "-r", "30",
+                    "-pix_fmt", "yuv420p",
+                    "-an",
+                    out_path,
+                ]
 
-    if not clips:
-        print("No clips were processed successfully")
-        return
+            _run(cmd)
+            shot_files.append(out_path)
 
-    final_clip = concatenate_videoclips(clips, method="compose")
-    final_clip.write_videofile(
-        output,
-        codec="libx264",
-        audio_codec="aac",
-        fps=30,
-        verbose=False,
-        logger=None,
-    )
-    print(f"Video rendered successfully: {output}")
+        if not shot_files:
+            print("No clips were processed successfully")
+            return
+
+        # Concat list file
+        list_file = os.path.join(tmpdir, "files.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for p in shot_files:
+                f.write(f"file '{p}'\n")
+
+        concat_out = os.path.join(tmpdir, "concat.mp4")
+        _run([
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",
+            concat_out,
+        ])
+
+        if audio_path:
+            # Mux reference audio, re-encode audio only
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", concat_out,
+                "-i", audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-shortest",
+                output,
+            ]
+            try:
+                _run(cmd)
+                print(f"Video rendered successfully: {output}")
+                return
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: audio mux failed ({e}); writing video without audio")
+
+        # Fallback: move concat video as final
+        shutil.move(concat_out, output)
+        print(f"Video rendered successfully: {output}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
