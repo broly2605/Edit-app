@@ -76,8 +76,10 @@ def render(timeline, output="output/final.mp4", audio_path=None):
                     out_path,
                 ]
             else:
+                start = shot.get("start", 0.0)
                 cmd = [
                     "ffmpeg", "-y",
+                    "-ss", str(start),
                     "-i", asset,
                     "-t", str(duration),
                     "-vf", _scale_filter(),
