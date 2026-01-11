@@ -1,9 +1,18 @@
 import math
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import cv2
 import numpy as np
+
+from analysis.scoring import (
+    beat_alignment_score,
+    brightness_score,
+    describe_candidate,
+    duration_fit_score,
+    final_score,
+    motion_score,
+)
 
 
 def _video_duration(path: str) -> float:
@@ -18,152 +27,207 @@ def _video_duration(path: str) -> float:
     return frames / fps
 
 
-def _sample_segment_scores(path: str, target_duration: float, beat_density: float) -> Tuple[float, Dict[str, Any]]:
-    # Sample a handful of evenly spaced windows and score motion/brightness.
-    dur = _video_duration(path)
-    if dur <= 0.0 or dur < target_duration:
-        return -math.inf, {"reason": "too_short", "duration": dur}
-
+def _sample_metrics(path: str, start: float, end: float, sample_frames: int = 3) -> Dict[str, float]:
     cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return {"motion": 0.0, "brightness": 0.0}
+
+    # Downscale for faster scoring reads only (does not affect output render)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 180)
+
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames_total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or (dur * fps)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    duration = total_frames / fps if fps > 0 else 0
+    if duration <= 0:
+        cap.release()
+        return {"motion": 0.0, "brightness": 0.0}
 
-    windows = 5
-    hop = max(1, int((frames_total - target_duration * fps) / max(1, windows)))
-    best_score = -math.inf
-    best_meta: Dict[str, Any] = {}
+    start = max(0.0, min(start, duration))
+    end = max(start, min(end, duration))
+    if end <= start:
+        cap.release()
+        return {"motion": 0.0, "brightness": 0.0}
 
-    for i in range(windows):
-        start_frame = i * hop
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        frames_to_read = int(target_duration * fps)
-        motions = []
-        brightness = []
-        prev_gray = None
-        read_frames = 0
-
-        while read_frames < frames_to_read:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            brightness.append(float(np.mean(gray)))
-            if prev_gray is not None:
-                flow = cv2.absdiff(gray, prev_gray)
-                motions.append(float(np.mean(flow)))
-            prev_gray = gray
-            read_frames += 1
-
-        if not motions:
+    frame_idxs = [int((start + (end - start) * (i / max(sample_frames - 1, 1))) * fps) for i in range(sample_frames)]
+    prev_gray = None
+    motions, brights = [], []
+    for idx in frame_idxs:
+        if idx >= total_frames:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok or frame is None:
             continue
-
-        motion_score = np.mean(motions)
-        brightness_score = np.mean(brightness)
-        beat_sync_score = -abs((read_frames / max(1, fps)) - target_duration)
-
-        # Weight beat density: more beats want more motion.
-        score = motion_score * (1 + beat_density) + 0.2 * brightness_score + beat_sync_score
-
-        if score > best_score:
-            best_score = score
-            best_meta = {
-                "start": start_frame / max(1, fps),
-                "duration": read_frames / max(1, fps),
-                "motion": motion_score,
-                "brightness": brightness_score,
-                "score": score,
-            }
-
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brights.append(float(np.mean(gray)))
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            motions.append(float(np.mean(diff)))
+        prev_gray = gray
     cap.release()
-    if best_score == -math.inf:
-        return -math.inf, {"reason": "no_windows", "duration": dur}
-    return best_score, best_meta
+
+    motion_raw = float(np.mean(motions)) if motions else 0.0
+    bright_raw = float(np.mean(brights)) if brights else 0.0
+    return {"motion": motion_score(motion_raw), "brightness": brightness_score(bright_raw)}
 
 
-def _score_image(path: str, target_duration: float) -> Tuple[float, Dict[str, Any]]:
-    img = cv2.imread(path)
+def _image_metrics(path: str) -> Dict[str, float]:
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        return -math.inf, {"reason": "unreadable"}
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    brightness = float(np.mean(gray))
-    contrast = float(np.std(gray))
-    score = brightness * 0.4 + contrast * 0.6 - abs(target_duration - 2.0)
-    return score, {"brightness": brightness, "contrast": contrast, "duration": target_duration}
+        return {"motion": 0.0, "brightness": 0.0}
+    bright_raw = float(np.mean(img))
+    return {"motion": 0.0, "brightness": brightness_score(bright_raw)}
 
 
 def _rank_assets(videos: List[str], images: List[str]) -> Dict[str, List[str]]:
-    videos_sorted = sorted(videos)
-    images_sorted = sorted(images)
-    return {"videos": videos_sorted, "images": images_sorted}
+    return {"videos": sorted(videos), "images": sorted(images)}
+
+
+def _enumerate_video_candidates(video: str, shot_len: float, beats: List[float], style_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    dur = _video_duration(video)
+    if dur <= 0 or shot_len <= 0:
+        return []
+
+    seg_len = min(max(shot_len, 0.4), min(shot_len * 1.2, 5.0))
+    stride = max(seg_len * 1.0, 0.4)  # fewer segments, faster; keeps ordering stable
+    candidates: List[Dict[str, Any]] = []
+
+    pos = 0.0
+    while pos + 0.2 <= dur:
+        start = pos
+        end = min(start + seg_len, dur)
+        metrics = _sample_metrics(video, start, end)
+        beat = beat_alignment_score(start, beats)
+        fit = duration_fit_score(end - start, shot_len)
+        score = final_score(metrics["motion"], metrics["brightness"], beat, fit, style_context)
+        candidates.append({
+            "asset": video,
+            "name": os.path.basename(video),
+            "type": "video",
+            "start": start,
+            "end": end,
+            "duration": end - start,
+            "score": score,
+            "metrics": {
+                "motion": metrics["motion"],
+                "brightness": metrics["brightness"],
+                "beat": beat,
+                "duration_fit": fit,
+            },
+        })
+        pos += stride
+
+    return candidates
+
+
+def _enumerate_image_candidates(image: str, shot_len: float, beats: List[float], style_context: Dict[str, Any]) -> List[Dict[str, Any]]:
+    metrics = _image_metrics(image)
+    beat = beat_alignment_score(0.0, beats)
+    fit = duration_fit_score(shot_len, shot_len)
+    score = final_score(metrics["motion"], metrics["brightness"], beat, fit, style_context)
+    return [{
+        "asset": image,
+        "name": os.path.basename(image),
+        "type": "image",
+        "duration": shot_len,
+        "effect": "ken_burns_slow",
+        "score": score,
+        "metrics": {
+            "motion": metrics["motion"],
+            "brightness": metrics["brightness"],
+            "beat": beat,
+            "duration_fit": fit,
+        },
+    }]
 
 
 def plan_timeline(blueprint: Dict[str, Any], videos: List[str], images: List[str], style_context: Dict[str, Any]) -> List[Dict[str, Any]]:
     shot_lengths = blueprint.get("shot_lengths", [])
     beats = blueprint.get("beats", [])
-    beat_density = len(beats) / max(1, blueprint.get("duration", len(shot_lengths)))
-
     assets = _rank_assets(videos, images)
+    image_usage = (style_context or {}).get("image_usage", "medium")
+    image_allowed = image_usage != "none"  # allow images for low/medium/high
+
     timeline: List[Dict[str, Any]] = []
+    log_lines: List[str] = []
+    shot_start = 0.0
+    use_counts: Dict[str, int] = {}
+    last_asset: str = ""
 
-    video_idx = 0
-    image_idx = 0
+    for shot_idx, duration in enumerate(shot_lengths):
+        candidates: List[Dict[str, Any]] = []
 
-    for i, duration in enumerate(shot_lengths):
-        use_image = False
-        if duration <= 1.2 and image_idx < len(assets["images"]):
-            use_image = True
+        for vf in assets["videos"]:
+            if os.path.isfile(vf):
+                candidates.extend(_enumerate_video_candidates(vf, duration, beats, style_context))
 
-        if use_image:
-            path = assets["images"][image_idx % len(assets["images"])]
-            image_idx += 1
-            score, meta = _score_image(path, duration)
+        # Allow images only for shots >= 1s and when style allows images
+        if image_allowed and duration >= 1.0:
+            for img in assets["images"]:
+                if os.path.isfile(img):
+                    candidates.extend(_enumerate_image_candidates(img, duration, beats, style_context))
+
+        if not candidates:
+            log_lines.append(f"[Shot {shot_idx}] No candidates found.")
             timeline.append({
-                "asset": path,
-                "type": "image",
-                "duration": duration,
-                "score": score,
-                "meta": meta,
-                "style": style_context.get("style", "default"),
-                "effect": style_context.get("image_effect", "zoom_in"),
-            })
-        else:
-            if not assets["videos"]:
-                # Fallback to any image if no videos exist.
-                if not assets["images"]:
-                    break
-                path = assets["images"][image_idx % len(assets["images"])]
-                image_idx += 1
-                score, meta = _score_image(path, duration)
-                timeline.append({
-                    "asset": path,
-                    "type": "image",
-                    "duration": duration,
-                    "score": score,
-                    "meta": meta,
-                    "style": style_context.get("style", "default"),
-                    "effect": style_context.get("image_effect", "zoom_in"),
-                })
-                continue
-
-            path = assets["videos"][video_idx % len(assets["videos"])]
-            video_idx += 1
-            score, meta = _sample_segment_scores(path, duration, beat_density)
-            timeline.append({
-                "asset": path,
+                "asset": None,
                 "type": "video",
+                "start": 0.0,
+                "end": duration,
                 "duration": duration,
-                "start": meta.get("start", 0.0),
-                "end": meta.get("start", 0.0) + meta.get("duration", duration),
-                "score": score,
-                "meta": meta,
+                "score": 0.0,
+                "metrics": {},
                 "style": style_context.get("style", "default"),
             })
+            shot_start += duration
+            continue
 
-    # Log top picks for transparency.
-    ranked = sorted(timeline, key=lambda x: x.get("score", -math.inf), reverse=True)
-    print("[Layer2] Top picks:")
-    for shot in ranked[:3]:
-        asset = os.path.basename(shot.get("asset", ""))
-        print(f"  {shot.get('type')} {asset} score={shot.get('score'):.2f} dur={shot.get('duration'):.2f}s")
+        # Diversify: apply a deterministic reuse penalty to avoid one asset dominating.
+        diversified = []
+        for cand in candidates:
+            asset = cand.get("asset", "")
+            base = cand.get("score", 0.0)
+            reuse_penalty = 1.0 / (1 + use_counts.get(asset, 0))
+            consecutive_penalty = 0.05 if asset == last_asset else 0.0
+            adjusted = base * reuse_penalty - consecutive_penalty
+            ccopy = dict(cand)
+            ccopy["score"] = adjusted
+            ccopy.setdefault("metrics", {})["reuse_penalty"] = reuse_penalty
+            ccopy["base_score"] = base
+            diversified.append(ccopy)
+
+        diversified.sort(key=lambda c: c.get("score", -math.inf), reverse=True)
+        top3 = diversified[:3]
+        chosen = top3[0]
+
+        timeline.append({
+            "asset": chosen.get("asset"),
+            "type": chosen.get("type"),
+            "start": chosen.get("start", 0.0),
+            "end": chosen.get("end", chosen.get("duration", duration)),
+            "duration": chosen.get("duration", duration),
+            "score": chosen.get("score", 0.0),
+            "metrics": chosen.get("metrics", {}),
+            "style": style_context.get("style", "default"),
+            "effect": chosen.get("effect"),
+        })
+
+        asset_key = chosen.get("asset", "")
+        if asset_key:
+            use_counts[asset_key] = use_counts.get(asset_key, 0) + 1
+            last_asset = asset_key
+
+        log_lines.append(
+            f"[Shot {shot_idx}] winner: {chosen.get('name','?')} score={chosen.get('score',0):.3f} "
+            f"base={chosen.get('base_score',0):.3f} reuse_penalty={chosen.get('metrics',{}).get('reuse_penalty',1):.2f}"
+        )
+        for idx, cand in enumerate(top3, start=1):
+            log_lines.append("   " + describe_candidate(idx, cand))
+
+        shot_start += duration
+
+    for line in log_lines:
+        print(line)
 
     return timeline
