@@ -1,6 +1,8 @@
 import math
 from typing import Dict, List
 
+from analysis import learning
+
 
 # Style-specific weights (sum to 1.0 across core metrics; bias is additive)
 STYLE_WEIGHTS: Dict[str, Dict[str, float]] = {
@@ -12,8 +14,7 @@ STYLE_WEIGHTS: Dict[str, Dict[str, float]] = {
 
 
 def style_weights(style_context: Dict) -> Dict[str, float]:
-    style = (style_context or {}).get("style", "fast")
-    return STYLE_WEIGHTS.get(style, STYLE_WEIGHTS["fast"])
+    return learning.get_adaptive_weights(style_context, STYLE_WEIGHTS)
 
 
 def motion_score(avg_frame_diff: float) -> float:

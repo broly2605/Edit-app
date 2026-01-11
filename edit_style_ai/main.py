@@ -21,6 +21,11 @@ def parse_args():
         required=True,
         help="Explicit style name (e.g., fast, cinematic, beat_sync, story). No auto mode.",
     )
+    parser.add_argument(
+        "--user",
+        default="global",
+        help="Optional user ID for learning profiles (Layer 4).",
+    )
     return parser.parse_args()
 
 
@@ -28,6 +33,7 @@ def main():
     args = parse_args()
     video_path = args.video
     style_context = get_style_context(args.style)
+    style_context["user_id"] = args.user
 
     print(f"[Layer1] Using style: {style_context['style']} (version {style_context['version']})")
 
